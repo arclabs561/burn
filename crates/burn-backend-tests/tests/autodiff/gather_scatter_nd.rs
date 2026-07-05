@@ -451,3 +451,76 @@ fn test_scatter_nd_assign_grad_k_equals_d() {
         .to_data()
         .assert_eq(&TensorData::from([1.0, 1.0]), false);
 }
+
+#[test]
+fn test_scatter_nd_max_grad_duplicate_indices() {
+    // Two value rows scatter into the SAME data row: winners are decided per
+    // duplicate group against the final output, not pairwise against the
+    // input. Group maxima per column: max(4,10,7)=10 (values row 0 wins),
+    // max(50,20,30)=50 (data wins), max(6,3,8)=8 (values row 1 wins).
+    let device = AutodiffDevice::new();
+    let data: TestTensor<2> =
+        TestTensor::from_data(TensorData::from([[1.0, 2.0, 3.0], [4.0, 50.0, 6.0]]), &device)
+            .require_grad();
+    let values: TestTensor<2> =
+        TestTensor::from_data(TensorData::from([[10.0, 20.0, 3.0], [7.0, 30.0, 8.0]]), &device)
+            .require_grad();
+    let indices = TestTensorInt::<2>::from_data(TensorData::from([[1], [1]]), &device);
+
+    let result: TestTensor<2> =
+        data.clone()
+            .scatter_nd(indices, values.clone(), IndexingUpdateOp::Max);
+    result.to_data().assert_eq(
+        &TensorData::from([[1.0, 2.0, 3.0], [10.0, 50.0, 8.0]]),
+        false,
+    );
+    let grads = result.sum().backward();
+
+    let grad_data = data.grad(&grads).unwrap();
+    let grad_values = values.grad(&grads).unwrap();
+
+    // Row 0 untouched -> ones. Row 1: data holds the extremum only in col 1.
+    grad_data.to_data().assert_eq(
+        &TensorData::from([[1.0, 1.0, 1.0], [0.0, 1.0, 0.0]]),
+        false,
+    );
+    // values[0] wins col 0 only; values[1] wins col 2 only. In particular
+    // values[1][0] = 7 gets NO gradient: it lost to values[0][0] = 10, a
+    // case only visible when winners are compared against the output.
+    grad_values.to_data().assert_eq(
+        &TensorData::from([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+        false,
+    );
+}
+
+#[test]
+fn test_scatter_nd_min_grad_duplicate_indices() {
+    // Min mirror: group minima per column decide the winners.
+    let device = AutodiffDevice::new();
+    let data: TestTensor<2> =
+        TestTensor::from_data(TensorData::from([[9.0, 1.0, 6.0]]), &device).require_grad();
+    let values: TestTensor<2> =
+        TestTensor::from_data(TensorData::from([[8.0, 5.0, 7.0], [3.0, 4.0, 9.0]]), &device)
+            .require_grad();
+    let indices = TestTensorInt::<2>::from_data(TensorData::from([[0], [0]]), &device);
+
+    let result: TestTensor<2> =
+        data.clone()
+            .scatter_nd(indices, values.clone(), IndexingUpdateOp::Min);
+    // Column minima: min(9,8,3)=3, min(1,5,4)=1, min(6,7,9)=6.
+    result
+        .to_data()
+        .assert_eq(&TensorData::from([[3.0, 1.0, 6.0]]), false);
+    let grads = result.sum().backward();
+
+    let grad_data = data.grad(&grads).unwrap();
+    let grad_values = values.grad(&grads).unwrap();
+
+    grad_data
+        .to_data()
+        .assert_eq(&TensorData::from([[0.0, 1.0, 1.0]]), false);
+    grad_values.to_data().assert_eq(
+        &TensorData::from([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        false,
+    );
+}

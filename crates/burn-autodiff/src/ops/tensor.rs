@@ -1245,21 +1245,30 @@ impl<B: Backend, C: CheckpointStrategy> FloatTensorOps<Self> for Autodiff<B, C> 
                 }
             }
             IndexingUpdateOp::Min | IndexingUpdateOp::Max => {
-                // Unique indices are required for this backward formula; duplicate indices have
-                // undefined behavior for scatter_nd Min/Max gradients.
                 // Forward (Max): out[idx] = max(data[idx], values); non-scattered: out = data.
-                // Backward, with ties contributing to both sides (matches cummin/cummax convention):
-                //   data_at_idx  = gather_nd(data, idx)
-                //   data_won     = data_at_idx >= values   (Max)  /  <= values (Min)
-                //   values_won   = values >= data_at_idx   (Max)  /  <= data_at_idx (Min)
-                //   data_mask    = scatter_nd(ones_like(data), idx, data_won, Assign)
-                //   grad_data    = grad * data_mask
-                //   grad_values  = gather_nd(grad, idx) * values_won
+                // Winner masks are computed against the forward OUTPUT, which keeps the
+                // gradient well-defined for duplicate indices: each duplicate group's
+                // winners are the elements equal to the group extremum, and ties
+                // contribute to all winners (matches the cummin/cummax convention).
+                // With unique indices this reduces to comparing data against values.
+                //   out_at_idx  = gather_nd(out, idx)
+                //   data_won    = data >= out          (Max)  /  data <= out    (Min)
+                //   values_won  = values >= out_at_idx (Max)  /  <= out_at_idx  (Min)
+                //   grad_data   = grad * data_won
+                //   grad_values = gather_nd(grad, idx) * values_won
+                // (data_won needs no scatter: at non-scattered positions out == data,
+                // so the comparison is 1 there by construction.)
                 #[derive(Debug)]
                 struct ScatterNdMinMax;
 
                 impl<B: Backend> Backward<B, 2> for ScatterNdMinMax {
-                    type State = (FloatTensor<B>, FloatTensor<B>, IntTensor<B>, bool);
+                    type State = (
+                        FloatTensor<B>,
+                        FloatTensor<B>,
+                        IntTensor<B>,
+                        FloatTensor<B>,
+                        bool,
+                    );
 
                     fn backward(
                         self,
@@ -1267,49 +1276,29 @@ impl<B: Backend, C: CheckpointStrategy> FloatTensorOps<Self> for Autodiff<B, C> 
                         grads: &mut Gradients,
                         _checkpointer: &mut Checkpointer,
                     ) {
-                        let (data, values, indices, is_max) = ops.state;
+                        let (data, values, indices, output, is_max) = ops.state;
                         let device = data.device();
                         let data_dtype = data.dtype();
-                        let data_shape = data.shape();
                         let settings = get_device_settings::<B>(&device);
                         let bool_dtype = settings.bool_dtype;
 
-                        // data_at_idx — needed for both winner masks
-                        let data_at_idx = B::float_gather_nd(data, indices.clone());
+                        let out_at_idx = B::float_gather_nd(output.clone(), indices.clone());
 
                         let (data_won_bool, values_won_bool) = if is_max {
                             (
-                                B::float_greater_equal(
-                                    data_at_idx.clone(),
-                                    values.clone(),
-                                    bool_dtype,
-                                ),
-                                B::float_greater_equal(values, data_at_idx, bool_dtype),
+                                B::float_greater_equal(data, output, bool_dtype),
+                                B::float_greater_equal(values, out_at_idx, bool_dtype),
                             )
                         } else {
                             (
-                                B::float_lower_equal(
-                                    data_at_idx.clone(),
-                                    values.clone(),
-                                    bool_dtype,
-                                ),
-                                B::float_lower_equal(values, data_at_idx, bool_dtype),
+                                B::float_lower_equal(data, output, bool_dtype),
+                                B::float_lower_equal(values, out_at_idx, bool_dtype),
                             )
                         };
 
-                        let data_won_float = B::bool_into_float(data_won_bool, data_dtype.into());
+                        let data_mask = B::bool_into_float(data_won_bool, data_dtype.into());
                         let values_won_float =
                             B::bool_into_float(values_won_bool, data_dtype.into());
-
-                        // Build the full-shape data mask: 1 at non-scattered positions,
-                        // data_won_float at scattered positions.
-                        let ones = B::float_ones(data_shape, &device, data_dtype.into());
-                        let data_mask = B::float_scatter_nd(
-                            ones,
-                            indices.clone(),
-                            data_won_float,
-                            IndexingUpdateOp::Assign,
-                        );
 
                         binary::<B, _, _>(
                             ops.parents,
@@ -1331,15 +1320,24 @@ impl<B: Backend, C: CheckpointStrategy> FloatTensorOps<Self> for Autodiff<B, C> 
                     .compute_bound()
                     .stateful()
                 {
-                    OpsKind::Tracked(prep) => prep.finish(
-                        (
+                    OpsKind::Tracked(prep) => {
+                        let output = B::float_scatter_nd(
                             data.primitive.clone(),
-                            values.primitive.clone(),
                             indices.clone(),
-                            is_max,
-                        ),
-                        B::float_scatter_nd(data.primitive, indices, values.primitive, reduction),
-                    ),
+                            values.primitive.clone(),
+                            reduction,
+                        );
+                        prep.finish(
+                            (
+                                data.primitive,
+                                values.primitive,
+                                indices,
+                                output.clone(),
+                                is_max,
+                            ),
+                            output,
+                        )
+                    }
                     OpsKind::UnTracked(prep) => prep.finish(B::float_scatter_nd(
                         data.primitive,
                         indices,
