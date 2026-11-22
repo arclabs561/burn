@@ -199,7 +199,7 @@ where
     /// Get an item from the dataset.
     fn get(&self, index: usize) -> Option<I> {
         // Row ids start with 1 (one) and index starts with 0 (zero)
-        let row_id = index + 1;
+        let row_id = i64::try_from(index).ok()?.checked_add(1)?;
 
         // Get a connection from the pool
         let connection = self.conn_pool.get().unwrap();
@@ -257,8 +257,8 @@ fn fetch_columns_and_len(
         connection.prepare(format!("select coalesce(max(row_id), 0) from {split}").as_str())?;
 
     let len = statement.query_row([], |row| {
-        let len: usize = row.get(0)?;
-        Ok(len)
+        let len: i64 = row.get(0)?;
+        usize::try_from(len).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, len))
     })?;
     Ok((columns, len))
 }
@@ -672,6 +672,7 @@ mod tests {
     #[rstest]
     pub fn get_none(train_dataset: SqlDs) {
         assert_eq!(train_dataset.get(10), None);
+        assert_eq!(train_dataset.get(usize::MAX), None);
     }
 
     #[rstest]

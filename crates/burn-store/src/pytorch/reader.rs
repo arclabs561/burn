@@ -426,7 +426,7 @@ fn load_pytorch_file_with_metadata(
         if !pickle_found {
             for i in 0..archive.len() {
                 let file = archive.by_index(i)?;
-                let name = file.name().to_string();
+                let name = file.name()?.into_owned();
                 drop(file); // Release the borrow
 
                 if name.ends_with("data.pkl") {
@@ -495,7 +495,7 @@ fn load_pytorch_file_with_metadata(
         let mut total_data_size = 0usize;
         for i in 0..archive.len() {
             let file = archive.by_index(i)?;
-            let name = file.name();
+            let name = file.name()?;
 
             // Look for data files - they can be in various locations
             let is_data_file = (name.contains("/data/")
@@ -957,7 +957,7 @@ fn read_pickle_as_value(path: &Path, top_level_key: Option<&str>) -> Result<Pick
         if pickle_data.is_empty() {
             for i in 0..archive.len() {
                 let file = archive.by_index(i)?;
-                let name = file.name().to_string();
+                let name = file.name()?.into_owned();
                 drop(file);
 
                 if name.ends_with("data.pkl") {
